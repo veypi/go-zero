@@ -18,17 +18,6 @@ var handlerTemplate string
 
 func genHandler(dir, webAPI, caller string, api *spec.ApiSpec, unwrapAPI bool) error {
 	filename := strings.Replace(api.Service.Name, "-api", "", 1) + ".ts"
-	if err := pathx.RemoveIfExist(path.Join(dir, filename)); err != nil {
-		return err
-	}
-	fp, created, err := apiutil.MaybeCreateFile(dir, "", filename)
-	if err != nil {
-		return err
-	}
-	if !created {
-		return nil
-	}
-	defer fp.Close()
 
 	imports := ""
 	if len(caller) == 0 {
@@ -38,6 +27,7 @@ func genHandler(dir, webAPI, caller string, api *spec.ApiSpec, unwrapAPI bool) e
 	if unwrapAPI {
 		importCaller = "{ " + importCaller + " }"
 	}
+	fmt.Printf("webAPI:%v\n", webAPI)
 	if len(webAPI) > 0 {
 		imports += `import ` + importCaller + ` from ` + `"./gocliRequest"`
 	}
@@ -50,49 +40,70 @@ func genHandler(dir, webAPI, caller string, api *spec.ApiSpec, unwrapAPI bool) e
 		imports += fmt.Sprintf(`import * as components from "%s"`, "./"+outputFile)
 		imports += fmt.Sprintf(`%sexport * from "%s"`, pathx.NL, "./"+outputFile)
 	}
-
-	apis, err := genAPI(api, caller)
-	if err != nil {
-		return err
-	}
-
 	t := template.Must(template.New("handlerTemplate").Parse(handlerTemplate))
-	return t.Execute(fp, map[string]string{
-		"imports": imports,
-		"apis":    strings.TrimSpace(apis),
-	})
+	fgroup := make(map[string]string)
+	for _, group := range api.Service.Groups {
+		fname := filename
+		if len(group.GetAnnotation("group")) > 0 {
+			fname = group.GetAnnotation("group") + ".ts"
+		}
+		apis, err := genAPI(group, caller)
+		if err != nil {
+			return err
+		}
+		fgroup[fname] = fgroup[fname] + apis
+	}
+	for fname, apis := range fgroup {
+		if err := pathx.RemoveIfExist(path.Join(dir, fname)); err != nil {
+			return err
+		}
+		fp, created, err := apiutil.MaybeCreateFile(dir, "", fname)
+		if err != nil {
+			return err
+		}
+		if !created {
+			return nil
+		}
+		defer fp.Close()
+		err = t.Execute(fp, map[string]string{
+			"imports": imports,
+			"apis":    strings.TrimSpace(apis),
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func genAPI(api *spec.ApiSpec, caller string) (string, error) {
+func genAPI(group spec.Group, caller string) (string, error) {
 	var builder strings.Builder
-	for _, group := range api.Service.Groups {
-		for _, route := range group.Routes {
-			handler := route.Handler
-			if len(handler) == 0 {
-				return "", fmt.Errorf("missing handler annotation for route %q", route.Path)
-			}
-
-			handler = util.Untitle(handler)
-			handler = strings.Replace(handler, "Handler", "", 1)
-			comment := commentForRoute(route)
-			if len(comment) > 0 {
-				fmt.Fprintf(&builder, "%s\n", comment)
-			}
-			fmt.Fprintf(&builder, "export function %s(%s) {\n", handler, paramsForRoute(route))
-			writeIndent(&builder, 1)
-			responseGeneric := "<null>"
-			if len(route.ResponseTypeName()) > 0 {
-				val, err := goTypeToTs(route.ResponseType, true)
-				if err != nil {
-					return "", err
-				}
-
-				responseGeneric = fmt.Sprintf("<%s>", val)
-			}
-			fmt.Fprintf(&builder, `return %s.%s%s(%s)`, caller, strings.ToLower(route.Method),
-				util.Title(responseGeneric), callParamsForRoute(route, group))
-			builder.WriteString("\n}\n\n")
+	for _, route := range group.Routes {
+		handler := route.Handler
+		if len(handler) == 0 {
+			return "", fmt.Errorf("missing handler annotation for route %q", route.Path)
 		}
+
+		handler = util.Untitle(handler)
+		handler = strings.Replace(handler, "Handler", "", 1)
+		comment := commentForRoute(route)
+		if len(comment) > 0 {
+			fmt.Fprintf(&builder, "%s\n", comment)
+		}
+		fmt.Fprintf(&builder, "export function %s(%s) {\n", handler, paramsForRoute(route))
+		writeIndent(&builder, 1)
+		responseGeneric := "<null>"
+		if len(route.ResponseTypeName()) > 0 {
+			val, err := goTypeToTs(route.ResponseType, true)
+			if err != nil {
+				return "", err
+			}
+
+			responseGeneric = fmt.Sprintf("<%s>", val)
+		}
+		fmt.Fprintf(&builder, `return %s.%s%s(%s)`, caller, strings.ToLower(route.Method),
+			util.Title(responseGeneric), callParamsForRoute(route, group))
+		builder.WriteString("\n}\n\n")
 	}
 
 	apis := builder.String()
@@ -170,18 +181,18 @@ func callParamsForRoute(route spec.Route, group spec.Group) string {
 	hasBody := hasRequestBody(route)
 	hasHeader := hasRequestHeader(route)
 
-	var params = []string{pathForRoute(route, group)}
+	var params = []string{}
 	if hasParams {
-		params = append(params, "params")
+		params = append(params, "\"params\":params")
 	}
 	if hasBody {
-		params = append(params, "req")
+		params = append(params, "\"req\":req")
 	}
 	if hasHeader {
-		params = append(params, "headers")
+		params = append(params, "\"headers\":headers")
 	}
 
-	return strings.Join(params, ", ")
+	return pathForRoute(route, group) + ", {" + strings.Join(params, ", ") + "}"
 }
 
 func pathForRoute(route spec.Route, group spec.Group) string {
